@@ -23,7 +23,7 @@
           padding: .8rem; width: 180px; }
   .card canvas { width: 100%; image-rendering: pixelated; border-radius: 6px; }
   .card .s { font-size: .85rem; color: #9aa3b2; margin-top: .4rem; }
-  .cell canvas { width: 72px; height: 72px; image-rendering: pixelated; border-radius: 4px; }
+  .cell canvas { width: 216px; height: 216px; image-rendering: pixelated; border-radius: 4px; }
   #annot { max-width: 100%; border-radius: 10px; border: 1px solid #2c323e; }
   #status { margin: 1rem 0 .4rem; color: #9aa3b2; }
   #bar { height: 8px; background: #232838; border-radius: 4px; overflow: hidden;
@@ -442,7 +442,7 @@ async function run(file) {
       weak.forEach(c => {
         const cell = document.createElement('div');
         cell.className = 'cell';
-        cell.appendChild(cropCanvas(img, c.x, c.y, c.size, 72));
+        cell.appendChild(cropCanvas(img, c.x, c.y, c.size, 216));
         d.appendChild(cell);
       });
     }
