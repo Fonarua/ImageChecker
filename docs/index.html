@@ -25,7 +25,10 @@
   .card .s { font-size: .85rem; color: #9aa3b2; margin-top: .4rem; }
   .cell canvas { width: 72px; height: 72px; image-rendering: pixelated; border-radius: 4px; }
   #annot { max-width: 100%; border-radius: 10px; border: 1px solid #2c323e; }
-  #status { margin: 1rem 0; color: #9aa3b2; }
+  #status { margin: 1rem 0 .4rem; color: #9aa3b2; }
+  #bar { height: 8px; background: #232838; border-radius: 4px; overflow: hidden;
+         margin-bottom: 1rem; display: none; }
+  #fill { height: 100%; width: 0%; background: #7aa2ff; transition: width .25s; }
   ul { line-height: 1.6; }
 </style>
 </head>
@@ -39,6 +42,7 @@
   the image is never uploaded anywhere.</div>
 </label>
 <div id="status">Loading Python runtime (~15 MB, first visit only)…</div>
+<div id="bar"><div id="fill"></div></div>
 <div id="out" style="display:none">
   <div class="verdict" id="verdict"></div>
   <h2>Provenance metadata</h2>
@@ -49,12 +53,17 @@
   <div id="tiers"></div>
 </div>
 
-<script src="https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js"></script>
 <script>
 const PYCODE = String.raw`
 import base64, io, json
 import numpy as np
 from PIL import Image, ImageFilter
+
+try:
+    from js import report          # progress callback provided by the worker
+except Exception:
+    def report(pct, label):
+        pass
 
 HIGH_DEPTH_MODES = ("I;16", "I;16B", "I;16L", "I;16N", "I", "F")
 
@@ -118,9 +127,14 @@ def find_sparkles(channels, threshold=0.55):
                (raw, 1.0, (16, 24, 32, 48, 64)),
                (blur, 0.5, (32, 48, 64)),
                (blur, 1.0, (32, 48, 64))]
+    total = sum(len(s) for _, _, s in configs)
+    done = 0
     hits = []
     for img, p, sizes in configs:
         for size in sizes:
+            done += 1
+            report(4 + int(58 * done / total),
+                   f"Searching for star marks — pass {done}/{total}")
             if size >= min(img.shape):
                 continue
             score = ncc_match(img, make_star_template(size, p))
@@ -191,17 +205,25 @@ def star_verify(channels, cx0, cy0, size):
 
 def analyze(data, max_candidates=200):
     data = bytes(data)
+    report(1, "Reading image")
     meta = check_metadata(data)
     im = to_gray8(Image.open(io.BytesIO(data)))
     raw = np.asarray(im, dtype=np.float64) / 255.0
     blur = np.asarray(im.filter(ImageFilter.GaussianBlur(2)), dtype=np.float64) / 255.0
     channels = (raw, blur)
     hits = sorted(find_sparkles(channels), reverse=True)[:max_candidates]
-    scored = sorted([(star_verify(channels, cx, cy, size), ncc, cx, cy, size)
-                     for ncc, cx, cy, size in hits], reverse=True)
-    cands = [{"star": round(float(s), 2), "ncc": round(float(n), 2),
+    scored = []
+    n = len(hits)
+    for i, (ncc, cx, cy, size) in enumerate(hits):
+        if i % 5 == 0:
+            report(62 + int(36 * i / max(n, 1)),
+                   f"Verifying star geometry — candidate {i}/{n}")
+        scored.append((star_verify(channels, cx, cy, size), ncc, cx, cy, size))
+    scored.sort(reverse=True)
+    report(99, "Rendering results")
+    cands = [{"star": round(float(s), 2), "ncc": round(float(n_), 2),
               "x": int(x), "y": int(y), "size": int(z)}
-             for s, n, x, y, z in scored]
+             for s, n_, x, y, z in scored]
     return json.dumps({"meta": meta, "w": im.size[0], "h": im.size[1],
                        "candidates": cands})
 
@@ -214,19 +236,63 @@ def to_png_b64(data):
     return base64.b64encode(buf.getvalue()).decode()
 `;
 
-const $ = id => document.getElementById(id);
-let pyodide = null, analyzeFn = null, toPngFn = null;
+const WORKER_BODY = `
+importScripts('https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js');
+self.report = (pct, label) => self.postMessage({type: 'progress', pct, label});
+const pyReady = (async () => {
+  self.postMessage({type: 'status', text: 'Loading Python runtime (~15 MB, first visit only)…'});
+  const py = await loadPyodide();
+  self.postMessage({type: 'status', text: 'Loading numpy + Pillow…'});
+  await py.loadPackage(['numpy', 'pillow']);
+  py.runPython(self.PYCODE);
+  self.postMessage({type: 'ready'});
+  return py;
+})();
+self.onmessage = async (e) => {
+  const {id, cmd, buf} = e.data;
+  try {
+    const py = await pyReady;
+    const u8 = new Uint8Array(buf);
+    const fn = py.globals.get(cmd === 'analyze' ? 'analyze' : 'to_png_b64');
+    self.postMessage({id, type: 'done', result: fn(py.toPy(u8))});
+  } catch (err) {
+    self.postMessage({id, type: 'error', message: String(err)});
+  }
+};
+`;
 
-async function boot() {
-  pyodide = await loadPyodide();
-  $('status').textContent = 'Loading numpy + Pillow…';
-  await pyodide.loadPackage(['numpy', 'pillow']);
-  pyodide.runPython(PYCODE);
-  analyzeFn = pyodide.globals.get('analyze');
-  toPngFn = pyodide.globals.get('to_png_b64');
-  $('status').textContent = 'Ready — drop an image to check it.';
+const $ = id => document.getElementById(id);
+
+function setStatus(text, pct) {
+  $('status').textContent = text;
+  if (pct == null) { $('bar').style.display = 'none'; }
+  else { $('bar').style.display = 'block'; $('fill').style.width = pct + '%'; }
 }
-const bootPromise = boot().catch(e => { $('status').textContent = 'Failed to load Python runtime: ' + e; });
+
+const pending = new Map();
+let nextId = 1;
+const workerSrc = 'self.PYCODE = ' + JSON.stringify(PYCODE) + ';\n' + WORKER_BODY;
+const worker = new Worker(URL.createObjectURL(new Blob([workerSrc], {type: 'text/javascript'})));
+worker.onmessage = (e) => {
+  const d = e.data;
+  if (d.type === 'status') setStatus(d.text, null);
+  else if (d.type === 'ready') setStatus('Ready — drop an image to check it.', null);
+  else if (d.type === 'progress') setStatus(d.label + '…', d.pct);
+  else if (d.id && pending.has(d.id)) {
+    const {resolve, reject} = pending.get(d.id);
+    pending.delete(d.id);
+    d.type === 'done' ? resolve(d.result) : reject(new Error(d.message));
+  }
+};
+worker.onerror = (e) => setStatus('Worker error: ' + (e.message || e), null);
+
+function call(cmd, buf) {
+  return new Promise((resolve, reject) => {
+    const id = nextId++;
+    pending.set(id, {resolve, reject});
+    worker.postMessage({id, cmd, buf});
+  });
+}
 
 const CONFIRMED = 2.0, LIKELY = 1.0, WEAK_SHOWN = 40;
 
@@ -261,21 +327,21 @@ function section(title, note) {
   return div;
 }
 
+let busy = false;
 async function run(file) {
-  await bootPromise;
-  if (!analyzeFn) return;
+  if (busy) return;
+  busy = true;
   $('out').style.display = 'none';
-  $('status').textContent = 'Analyzing… (up to a minute or two for large images; the page may freeze meanwhile)';
-  await new Promise(r => setTimeout(r, 50));   // let the status paint
   try {
-    const buf = new Uint8Array(await file.arrayBuffer());
-    const res = JSON.parse(analyzeFn(pyodide.toPy(buf)));
+    setStatus('Reading file…', 2);
+    const buf = await file.arrayBuffer();
+    const res = JSON.parse(await call('analyze', buf.slice(0)));
 
     const img = new Image();
     img.src = URL.createObjectURL(new Blob([buf]));
     try { await img.decode(); }
     catch { // browser can't display this format (e.g. TIFF): ask Python for a PNG
-      img.src = 'data:image/png;base64,' + toPngFn(pyodide.toPy(buf));
+      img.src = 'data:image/png;base64,' + await call('png', buf.slice(0));
       await img.decode();
     }
 
@@ -327,9 +393,11 @@ async function run(file) {
       });
     }
     $('out').style.display = 'block';
-    $('status').textContent = 'Done. Drop another image to check it.';
+    setStatus('Done. Drop another image to check it.', null);
   } catch (e) {
-    $('status').textContent = 'Could not analyze this file: ' + e;
+    setStatus('Could not analyze this file: ' + e.message, null);
+  } finally {
+    busy = false;
   }
 }
 
@@ -337,7 +405,7 @@ const drop = $('drop'), file = $('file');
 file.addEventListener('change', () => file.files.length && run(file.files[0]));
 ['dragover', 'dragenter'].forEach(e => drop.addEventListener(e, ev => { ev.preventDefault(); drop.classList.add('hover'); }));
 ['dragleave', 'drop'].forEach(e => drop.addEventListener(e, ev => { ev.preventDefault(); drop.classList.remove('hover'); }));
-drop.addEventListener('drop', ev => ev.dataTransfer.files.length && run(ev.dataTransfer.files[0]));
+drop.addEventListener('drop', ev => { ev.preventDefault(); ev.dataTransfer.files.length && run(ev.dataTransfer.files[0]); });
 </script>
 </body>
 </html>

@@ -54,6 +54,11 @@ PAGE = """<!doctype html>
   ul { line-height: 1.6; }
   a { color: #7aa2ff; }
   .spin { display: none; margin: 1rem 0; color: #9aa3b2; }
+  .spin .bar { height: 8px; background: #232838; border-radius: 4px;
+               overflow: hidden; margin-top: .5rem; }
+  .spin .fill { height: 100%; width: 35%; background: #7aa2ff; border-radius: 4px;
+                animation: slide 1.2s ease-in-out infinite; }
+  @keyframes slide { 0% { margin-left: -35%; } 100% { margin-left: 100%; } }
 </style>
 </head>
 <body>
@@ -66,7 +71,9 @@ PAGE = """<!doctype html>
     <div class="muted">JPEG / PNG / WebP / TIFF, up to 50 MB. Everything stays on your machine.</div>
   </label>
 </form>
-<div class="spin" id="spin">Analyzing… (a few seconds for large images)</div>
+<div class="spin" id="spin">Analyzing… (10–30 seconds depending on image size)
+  <div class="bar"><div class="fill"></div></div>
+</div>
 
 {% if result %}
   <div class="verdict {{ result.verdict_class }}">{{ result.verdict }}</div>
