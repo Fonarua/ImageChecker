@@ -1,0 +1,334 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Image Checker</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: -apple-system, system-ui, sans-serif; background: #14161a;
+         color: #e6e6e6; max-width: 980px; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.4rem; } h2 { font-size: 1.1rem; margin-top: 2rem; }
+  .drop { border: 2px dashed #4a5160; border-radius: 12px; padding: 3rem 1rem;
+          text-align: center; cursor: pointer; transition: background .15s; }
+  .drop.hover { background: #1e2330; border-color: #7aa2ff; }
+  .drop input { display: none; }
+  .muted { color: #9aa3b2; font-size: .9rem; }
+  .verdict { padding: 1rem 1.2rem; border-radius: 10px; margin: 1.2rem 0; font-size: 1.05rem; }
+  .v-red { background: #3a1f24; border: 1px solid #a94452; }
+  .v-yellow { background: #3a331f; border: 1px solid #a98f44; }
+  .v-green { background: #1f3a26; border: 1px solid #44a95e; }
+  .cards { display: flex; flex-wrap: wrap; gap: 1rem; }
+  .card { background: #1c2028; border: 1px solid #2c323e; border-radius: 10px;
+          padding: .8rem; width: 180px; }
+  .card canvas { width: 100%; image-rendering: pixelated; border-radius: 6px; }
+  .card .s { font-size: .85rem; color: #9aa3b2; margin-top: .4rem; }
+  .cell canvas { width: 72px; height: 72px; image-rendering: pixelated; border-radius: 4px; }
+  #annot { max-width: 100%; border-radius: 10px; border: 1px solid #2c323e; }
+  #status { margin: 1rem 0; color: #9aa3b2; }
+  ul { line-height: 1.6; }
+</style>
+</head>
+<body>
+<h1>🔎 Image Checker <span class="muted">— AI watermark &amp; provenance scan</span></h1>
+
+<label class="drop" id="drop">
+  <input type="file" id="file" accept="image/*,.tif,.tiff">
+  <div><strong>Drop an image here</strong> or click to choose a file</div>
+  <div class="muted">JPEG / PNG / WebP / TIFF. Analysis runs entirely in your browser —
+  the image is never uploaded anywhere.</div>
+</label>
+<div id="status">Loading Python runtime (~15 MB, first visit only)…</div>
+<div id="out" style="display:none">
+  <div class="verdict" id="verdict"></div>
+  <h2>Provenance metadata</h2>
+  <div id="meta"></div>
+  <h2 id="imgtitle">Scanned image</h2>
+  <p class="muted">Red boxes = confirmed star marks, yellow = likely star shapes.</p>
+  <canvas id="annot"></canvas>
+  <div id="tiers"></div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js"></script>
+<script>
+const PYCODE = String.raw`
+import io, json
+import numpy as np
+from PIL import Image, ImageFilter
+
+HIGH_DEPTH_MODES = ("I;16", "I;16B", "I;16L", "I;16N", "I", "F")
+
+def to_gray8(im):
+    if im.mode in HIGH_DEPTH_MODES:
+        a = np.asarray(im, dtype=np.float64)
+        lo, hi = a.min(), a.max()
+        a = (a - lo) / (hi - lo + 1e-9)
+        return Image.fromarray((a * 255).astype(np.uint8), "L")
+    return im.convert("L")
+
+def check_metadata(data):
+    findings = []
+    if data.find(b"http://ns.adobe.com/xap/1.0/") != -1:
+        findings.append("XMP block present")
+    if data.find(b"Exif\x00\x00") != -1:
+        findings.append("EXIF block present")
+    for marker, label in [(b"c2pa", "C2PA content credentials"),
+                          (b"GContainer", "Google GContainer (Gemini/Pixel)"),
+                          (b"trainedAlgorithmicMedia", "IPTC trainedAlgorithmicMedia (declared AI)"),
+                          (b"Midjourney", "Midjourney"), (b"DALL-E", "DALL-E")]:
+        if data.find(marker) != -1:
+            findings.append(label)
+    try:
+        exif = Image.open(io.BytesIO(data)).getexif()
+        for tag, label in ((305, "software"), (271, "camera make"),
+                           (272, "camera model"), (315, "artist"), (306, "modified")):
+            if tag in exif:
+                findings.append(f"{label}: {str(exif[tag]).strip()}")
+    except Exception:
+        pass
+    return findings
+
+def make_star_template(size=32, p=0.5):
+    n = size
+    y, x = np.mgrid[0:n, 0:n]
+    c = (n - 1) / 2
+    dx, dy = np.abs(x - c) / c, np.abs(y - c) / c
+    return ((dx ** p + dy ** p) <= 1.0).astype(np.float64)
+
+def ncc_match(img, tpl):
+    ih, iw = img.shape
+    th, tw = tpl.shape
+    tplz = tpl - tpl.mean()
+    tnorm = np.sqrt((tplz ** 2).sum())
+    fshape = (ih + th - 1, iw + tw - 1)
+    F = np.fft.rfft2(img, fshape)
+    T = np.fft.rfft2(tplz[::-1, ::-1], fshape)
+    corr = np.fft.irfft2(F * T, fshape)[th - 1:ih, tw - 1:iw]
+    ii = np.cumsum(np.cumsum(np.pad(img, ((1, 0), (1, 0))), 0), 1)
+    ii2 = np.cumsum(np.cumsum(np.pad(img ** 2, ((1, 0), (1, 0))), 0), 1)
+    s = ii[th:, tw:] - ii[:-th, tw:] - ii[th:, :-tw] + ii[:-th, :-tw]
+    s2 = ii2[th:, tw:] - ii2[:-th, tw:] - ii2[th:, :-tw] + ii2[:-th, :-tw]
+    npix = th * tw
+    var = np.maximum(s2 - s ** 2 / npix, 1e-9)
+    return corr / (np.sqrt(var) * tnorm)
+
+def find_sparkles(channels, threshold=0.55):
+    raw, blur = channels
+    configs = [(raw, 0.5, (16, 24, 32, 48, 64)),
+               (raw, 1.0, (16, 24, 32, 48, 64)),
+               (blur, 0.5, (32, 48, 64)),
+               (blur, 1.0, (32, 48, 64))]
+    hits = []
+    for img, p, sizes in configs:
+        for size in sizes:
+            if size >= min(img.shape):
+                continue
+            score = ncc_match(img, make_star_template(size, p))
+            while True:
+                ij = np.unravel_index(np.argmax(score), score.shape)
+                v = score[ij]
+                if v < threshold:
+                    break
+                cy, cx = ij[0] + size // 2, ij[1] + size // 2
+                hits.append((v, cx, cy, size))
+                y0, y1 = max(0, ij[0] - size), ij[0] + size
+                x0, x1 = max(0, ij[1] - size), ij[1] + size
+                score[y0:y1, x0:x1] = 0
+    merged = []
+    for v, cx, cy, size in sorted(hits, reverse=True):
+        if all((cx - m[1]) ** 2 + (cy - m[2]) ** 2 > (max(size, m[3])) ** 2
+               for m in merged):
+            merged.append((v, cx, cy, size))
+    return merged
+
+def arm_score(img, cx, cy, R, fat=False):
+    H, W = img.shape
+    M = int(1.55 * R) + 2
+    if not (M <= cy < H - M and M <= cx < W - M):
+        return None
+    p = img[cy - M:cy + M + 1, cx - M:cx + M + 1]
+    c = M
+    if fat:
+        rs = np.arange(max(2, int(R * 0.50)), max(int(R * 0.90), 4))
+        o = max(3, int(R * 0.60))
+    else:
+        rs = np.arange(max(2, int(R * 0.30)), max(int(R * 0.85), 4))
+        o = max(3, int(R * 0.45))
+    rt = np.arange(int(R * 1.10), max(int(R * 1.45), int(R * 1.10) + 2))
+    d = (rs / np.sqrt(2)).astype(int)
+    diag = np.concatenate([p[c + d, c + d], p[c + d, c - d],
+                           p[c - d, c + d], p[c - d, c - d]])
+    center = p[c - 1:c + 2, c - 1:c + 2].mean()
+    pol = 1.0 if center >= diag.mean() else -1.0
+    arms = []
+    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+        px, py = -dy, dx
+        on = p[c + dy * rs, c + dx * rs]
+        side = np.concatenate([p[c + dy * rs + py * o, c + dx * rs + px * o],
+                               p[c + dy * rs - py * o, c + dx * rs - px * o]])
+        norm = side.std() + 0.03
+        contrast = pol * (on.mean() - side.mean()) / norm
+        tip = p[c + dy * rt, c + dx * rt]
+        ends = pol * (on.mean() - tip.mean()) / norm
+        arms.append(min(contrast, 1.5 * ends))
+    return min(arms)
+
+def star_verify(channels, cx0, cy0, size):
+    best = -9.0
+    for ci, img in enumerate(channels):
+        for fat in (False, True):
+            for f in (0.5, 0.75, 1.0, 1.5, 2.0):
+                R = max(8, int(size * f))
+                if ci > 0 and R < 24:
+                    continue
+                step = max(2, R // 6)
+                for dy in (-2 * step, -step, 0, step, 2 * step):
+                    for dx in (-2 * step, -step, 0, step, 2 * step):
+                        s = arm_score(img, cx0 + dx, cy0 + dy, R, fat)
+                        if s is not None and s > best:
+                            best = s
+    return best
+
+def analyze(data, max_candidates=200):
+    data = bytes(data)
+    meta = check_metadata(data)
+    im = to_gray8(Image.open(io.BytesIO(data)))
+    raw = np.asarray(im, dtype=np.float64) / 255.0
+    blur = np.asarray(im.filter(ImageFilter.GaussianBlur(2)), dtype=np.float64) / 255.0
+    channels = (raw, blur)
+    hits = sorted(find_sparkles(channels), reverse=True)[:max_candidates]
+    scored = sorted([(star_verify(channels, cx, cy, size), ncc, cx, cy, size)
+                     for ncc, cx, cy, size in hits], reverse=True)
+    cands = [{"star": round(float(s), 2), "ncc": round(float(n), 2),
+              "x": int(x), "y": int(y), "size": int(z)}
+             for s, n, x, y, z in scored]
+    return json.dumps({"meta": meta, "w": im.size[0], "h": im.size[1],
+                       "candidates": cands})
+`;
+
+const $ = id => document.getElementById(id);
+let pyodide = null, analyzeFn = null;
+
+async function boot() {
+  pyodide = await loadPyodide();
+  $('status').textContent = 'Loading numpy + Pillow…';
+  await pyodide.loadPackage(['numpy', 'pillow']);
+  pyodide.runPython(PYCODE);
+  analyzeFn = pyodide.globals.get('analyze');
+  $('status').textContent = 'Ready — drop an image to check it.';
+}
+const bootPromise = boot().catch(e => { $('status').textContent = 'Failed to load Python runtime: ' + e; });
+
+const CONFIRMED = 2.0, LIKELY = 1.0, WEAK_SHOWN = 40;
+
+function cropCanvas(img, cx, cy, size, out) {
+  const half = Math.max(Math.round(size * 1.6), 40);
+  const x0 = Math.max(0, cx - half), y0 = Math.max(0, cy - half);
+  const w = Math.min(img.width, cx + half) - x0, h = Math.min(img.height, cy + half) - y0;
+  const c = document.createElement('canvas');
+  c.width = out; c.height = out;
+  const g = c.getContext('2d');
+  g.imageSmoothingEnabled = false;
+  g.drawImage(img, x0, y0, w, h, 0, 0, out, out);
+  return c;
+}
+
+function card(img, c) {
+  const div = document.createElement('div');
+  div.className = 'card';
+  div.appendChild(cropCanvas(img, c.x, c.y, c.size, 160));
+  const s = document.createElement('div');
+  s.className = 's';
+  s.textContent = `(${c.x}, ${c.y}) · star ${c.star.toFixed(1)} · ncc ${c.ncc.toFixed(2)}`;
+  div.appendChild(s);
+  return div;
+}
+
+function section(title, note) {
+  const h = document.createElement('h2'); h.textContent = title;
+  const p = document.createElement('p'); p.className = 'muted'; p.textContent = note;
+  const div = document.createElement('div'); div.className = 'cards';
+  $('tiers').append(h, p, div);
+  return div;
+}
+
+async function run(file) {
+  await bootPromise;
+  if (!analyzeFn) return;
+  $('out').style.display = 'none';
+  $('status').textContent = 'Analyzing… (up to a minute or two for large images; the page may freeze meanwhile)';
+  await new Promise(r => setTimeout(r, 50));   // let the status paint
+  try {
+    const buf = new Uint8Array(await file.arrayBuffer());
+    const res = JSON.parse(analyzeFn(pyodide.toPy(buf)));
+
+    const img = new Image();
+    img.src = URL.createObjectURL(new Blob([buf]));
+    try { await img.decode(); }
+    catch { // browser can't display TIFF: rebuild a PNG from pyodide? fall back to gray box
+      img.width = res.w; img.height = res.h;
+    }
+
+    const confirmed = res.candidates.filter(c => c.star >= CONFIRMED);
+    const likely = res.candidates.filter(c => c.star >= LIKELY && c.star < CONFIRMED);
+    const weak = res.candidates.filter(c => c.star < LIKELY).slice(0, WEAK_SHOWN);
+
+    const v = $('verdict');
+    const declared = res.meta.some(m => /C2PA|Gemini|AI/.test(m));
+    if (declared) { v.className = 'verdict v-red'; v.textContent = '🚨 File metadata declares AI generation or carries content credentials.'; }
+    else if (confirmed.length) { v.className = 'verdict v-red'; v.textContent = `🚨 ${confirmed.length} four-pointed star mark(s) confirmed — inspect the red crops. An isolated star on a flat area is an AI watermark.`; }
+    else if (likely.length) { v.className = 'verdict v-yellow'; v.textContent = `⚠️ ${likely.length} star-like shape(s) found — check the crops to judge whether they are watermarks or just artwork.`; }
+    else { v.className = 'verdict v-green'; v.textContent = '✅ No star watermark found. Absence of evidence is not proof — watermarks can be cropped, and very faint marks can hide among the weak candidates.'; }
+
+    $('meta').innerHTML = res.meta.length
+      ? '<ul>' + res.meta.map(m => `<li>${m.replace(/</g,'&lt;')}</li>`).join('') + '</ul>'
+      : '<p class="muted">None — EXIF/XMP/C2PA fully stripped. Proves nothing by itself, but the file\'s history can\'t be traced.</p>';
+
+    $('imgtitle').textContent = `Scanned image (${res.w}×${res.h})`;
+    const an = $('annot');
+    an.width = res.w; an.height = res.h;
+    const g = an.getContext('2d');
+    if (img.complete && img.naturalWidth) g.drawImage(img, 0, 0);
+    else { g.fillStyle = '#333'; g.fillRect(0, 0, res.w, res.h); }
+    g.lineWidth = Math.max(2, res.w / 500);
+    for (const [list, color] of [[confirmed, '#ff4455'], [likely, '#e6c34a']]) {
+      g.strokeStyle = color;
+      for (const c of list) g.strokeRect(c.x - c.size, c.y - c.size, 2 * c.size, 2 * c.size);
+    }
+
+    $('tiers').innerHTML = '';
+    if (confirmed.length) {
+      const d = section(`Confirmed star marks (${confirmed.length})`,
+        'Clean four-pointed star geometry. On a flat area or asset corner (not inside artwork like a night sky) it is almost certainly an AI watermark.');
+      confirmed.forEach(c => d.appendChild(card(img, c)));
+    }
+    if (likely.length) {
+      const d = section(`Likely star shapes (${likely.length})`,
+        'Star-like geometry — may be watermarks, decorative sparkles, or star glints inside artwork. Judge by what surrounds them.');
+      likely.forEach(c => d.appendChild(card(img, c)));
+    }
+    if (weak.length) {
+      const d = section(`Weak candidates (${weak.length} shown)`,
+        'Ranked; mostly noise, but very faint watermarks can end up here — scan if the image is suspicious.');
+      weak.forEach(c => {
+        const cell = document.createElement('div');
+        cell.className = 'cell';
+        cell.appendChild(cropCanvas(img, c.x, c.y, c.size, 72));
+        d.appendChild(cell);
+      });
+    }
+    $('out').style.display = 'block';
+    $('status').textContent = 'Done. Drop another image to check it.';
+  } catch (e) {
+    $('status').textContent = 'Could not analyze this file: ' + e;
+  }
+}
+
+const drop = $('drop'), file = $('file');
+file.addEventListener('change', () => file.files.length && run(file.files[0]));
+['dragover', 'dragenter'].forEach(e => drop.addEventListener(e, ev => { ev.preventDefault(); drop.classList.add('hover'); }));
+['dragleave', 'drop'].forEach(e => drop.addEventListener(e, ev => { ev.preventDefault(); drop.classList.remove('hover'); }));
+drop.addEventListener('drop', ev => ev.dataTransfer.files.length && run(ev.dataTransfer.files[0]));
+</script>
+</body>
+</html>
