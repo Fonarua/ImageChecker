@@ -107,8 +107,8 @@ def find_sparkles(path, threshold=0.55, channels=None):
     # raw image; on the blurred channel only large sizes make sense
     configs = [(raw, 0.5, (16, 24, 32, 48, 64)),
                (raw, 1.0, (16, 24, 32, 48, 64)),
-               (blur, 0.5, (32, 48, 64)),
-               (blur, 1.0, (32, 48, 64))]
+               (blur, 0.5, (16, 24, 32, 48, 64)),
+               (blur, 1.0, (12, 16, 24, 32, 48, 64))]
     hits = []
     for img, p, sizes in configs:
         for size in sizes:
@@ -160,6 +160,12 @@ def arm_score(img, cx, cy, R, fat=False):
     d = (rs / np.sqrt(2)).astype(int)
     diag = np.concatenate([p[c + d, c + d], p[c + d, c - d],
                            p[c - d, c + d], p[c - d, c - d]])
+    # far-diagonal samples: outside both a thin star and a fat diamond,
+    # but still inside a round dot of similar radius (dot rejection)
+    rd = np.arange(max(2, int(R * 0.80)), max(int(R * 1.05), int(R * 0.80) + 2))
+    dd = (rd / np.sqrt(2)).astype(int)
+    diag_far = np.concatenate([p[c + dd, c + dd], p[c + dd, c - dd],
+                               p[c - dd, c + dd], p[c - dd, c - dd]])
     center = p[c - 1:c + 2, c - 1:c + 2].mean()
     pol = 1.0 if center >= diag.mean() else -1.0
     arms = []
@@ -175,8 +181,60 @@ def arm_score(img, cx, cy, R, fat=False):
         # Weighted 1.5x so soft translucent tips aren't over-penalized.
         tip = p[c + dy * rt, c + dx * rt]
         ends = pol * (on.mean() - tip.mean()) / norm
-        arms.append(min(contrast, 1.5 * ends))
+        # arms must beat the far diagonals, otherwise this is a round
+        # blob (e.g. halftone dots), not a four-pointed star
+        dterm = pol * (on.mean() - diag_far.mean()) / norm
+        # arms must be CONTINUOUS: a chain of separate dots (halftone
+        # grids form star-like quincunx layouts) has dark gaps along the
+        # arm, a real star does not — check the smoothed profile floor
+        prof = np.convolve(on, np.ones(3) / 3, mode="valid") if len(on) >= 3 else on
+        gap = pol * (prof.min() if pol > 0 else prof.max()) - pol * side.mean()
+        gap /= norm
+        arms.append(min(contrast, 1.5 * ends, 1.5 * dterm, 2.0 * gap))
     return min(arms)
+
+
+def upscaled_arm(img, cx, cy, R):
+    """arm_score on a 2x-upscaled local patch: small stars (~10-20px) leave
+    too few pixels per arm at native resolution for reliable sampling."""
+    m = 4 * R + 8
+    if not (m <= cy < img.shape[0] - m and m <= cx < img.shape[1] - m):
+        return None
+    patch = img[cy - m:cy + m, cx - m:cx + m]
+    im = Image.fromarray((patch * 255).astype(np.uint8)).resize(
+        (4 * m, 4 * m), Image.BICUBIC)
+    up = np.asarray(im, dtype=np.float64) / 255.0
+    best = None
+    for fat in (False, True):
+        for dy in (-4, -2, 0, 2, 4):
+            for dx in (-4, -2, 0, 2, 4):
+                s = arm_score(up, 2 * m + dx, 2 * m + dy, 2 * R, fat)
+                if s is not None and (best is None or s > best):
+                    best = s
+    return best
+
+
+def periodicity(raw, blur, cx, cy, size):
+    """Strongest short-lag autocorrelation peak of the fine-detail band
+    around the candidate. High for halftone/dot lattices (4-24px spacing),
+    low around isolated star marks. Sub-3px dither is excluded by the lag
+    floor (it is harmless: the blur channel removes it)."""
+    w = max(24, 3 * size)
+    H, W = raw.shape
+    x0 = min(max(cx - w, 0), max(W - 2 * w, 0))
+    y0 = min(max(cy - w, 0), max(H - 2 * w, 0))
+    a = (raw - blur)[y0:y0 + 2 * w, x0:x0 + 2 * w]
+    if min(a.shape) < 16:
+        return 0.0
+    a = a - a.mean()
+    P = np.abs(np.fft.rfft2(a)) ** 2
+    ac = np.fft.irfft2(P, a.shape)
+    ac = ac / (ac[0, 0] + 1e-12)
+    ny, nx = a.shape
+    yy, xx = np.mgrid[0:ny, 0:nx]
+    lag2 = np.minimum(yy, ny - yy) ** 2 + np.minimum(xx, nx - xx) ** 2
+    mask = (lag2 >= 9) & (lag2 <= 24 ** 2)
+    return float(ac[mask].max()) if mask.any() else 0.0
 
 
 def star_verify(channels, cx0, cy0, size):
@@ -195,6 +253,19 @@ def star_verify(channels, cx0, cy0, size):
                         s = arm_score(img, cx0 + dx, cy0 + dy, R, fat)
                         if s is not None and s > best:
                             best = s
+    if size <= 20 and best < 2.0:  # fine-grained pass for small marks
+        up = -9.0
+        for img in channels:
+            for R in range(max(5, size // 2 - 2), size // 2 + 3):
+                s = upscaled_arm(img, cx0, cy0, R)
+                if s is not None and s > up:
+                    up = s
+        if up > best:
+            # dot lattices form star-like layouts that fool the upscaled
+            # sampling — accept its verdict only on non-periodic ground
+            if periodicity(channels[0], channels[1], cx0, cy0, size) >= 0.33:
+                up = min(up, 0.9)
+            best = max(best, up)
     return best
 
 
