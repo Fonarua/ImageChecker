@@ -5,41 +5,163 @@ Layer 2: visible-watermark template matching (Gemini sparkle glyph)
          via FFT-based normalized cross-correlation at multiple scales.
 """
 
+import re
 import sys
+import zlib
+
 import numpy as np
 from PIL import Image, ImageFilter
 
 
-# ---------- Layer 1: metadata ----------
+# ---------- Layer 1: metadata / provenance ----------
 
-def check_metadata(path):
+def _xmp_findings(data):
+    """Parse XMP packets and report the provenance-relevant fields."""
     findings = []
-    data = open(path, "rb").read()
-    if data.find(b"http://ns.adobe.com/xap/1.0/") != -1:
-        findings.append("XMP block present")
-    if data.find(b"Exif\x00\x00") != -1:
-        findings.append("EXIF block present")
+    packets = re.findall(rb"<x:xmpmeta[^>]*>.*?</x:xmpmeta>", data, re.S)
+    if not packets and data.find(b"http://ns.adobe.com/xap/1.0/") != -1:
+        return ["XMP block present (unparseable)"]
+    for pkt in packets:
+        text = pkt.decode("utf-8", errors="replace")
+        fields = [
+            (r'(?:xmp:)?CreatorTool\s*=\s*"([^"]+)"|<xmp:CreatorTool>([^<]+)<',
+             "XMP creator tool"),
+            (r'DigitalSourceType\s*=\s*"([^"]+)"|<Iptc4xmpExt:DigitalSourceType>([^<]+)<',
+             "XMP digital source type"),
+            (r'(?:photoshop|plus):Credit\s*=\s*"([^"]+)"|<(?:photoshop|plus):Credit>([^<]+)<',
+             "XMP credit"),
+            (r'dc:creator[^>]*>.*?<rdf:li[^>]*>([^<]+)<', "XMP creator"),
+        ]
+        got = False
+        for pattern, label in fields:
+            for m in re.finditer(pattern, text, re.S):
+                val = next((g for g in m.groups() if g), "").strip()
+                if val:
+                    findings.append(f"{label}: {val[:120]}")
+                    got = True
+        if not got:
+            findings.append("XMP packet present (no notable fields)")
+    return findings
+
+
+def _c2pa_findings(data):
+    """Detect C2PA / JUMBF content-credential manifests and try to name
+    the claim generator (proper validation needs a C2PA library)."""
+    findings = []
+    idx = data.find(b"c2pa.claim")
+    if idx == -1:
+        idx = data.find(b"c2pa")
+        if idx == -1 or data.find(b"jumb") == -1:
+            return findings
+    findings.append("C2PA content credentials manifest present")
+    region = data[max(0, idx - 4000):idx + 4000]
+    gi = region.find(b"claim_generator")
+    if gi != -1:
+        run = re.search(rb"[\x20-\x7e]{4,120}", region[gi + 15:gi + 300])
+        if run:
+            findings.append(
+                f"C2PA claim generator: {run.group().decode(errors='replace').strip()[:120]}")
+    for tool in (b"Adobe Firefly", b"Photoshop", b"DALL-E", b"OpenAI",
+                 b"Google", b"Gemini", b"Microsoft"):
+        if region.find(tool) != -1:
+            findings.append(f"C2PA mentions: {tool.decode()}")
+    return findings
+
+
+def _png_findings(data):
+    """Walk PNG chunks: generators declare themselves in tEXt/iTXt/zTXt
+    (e.g. Stable Diffusion 'parameters', ComfyUI 'prompt'/'workflow')."""
+    findings = []
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        return findings
+    pos = 8
+    while pos + 8 <= len(data):
+        length = int.from_bytes(data[pos:pos + 4], "big")
+        ctype = data[pos + 4:pos + 8]
+        chunk = data[pos + 8:pos + 8 + length]
+        pos += 12 + length
+        if ctype not in (b"tEXt", b"iTXt", b"zTXt"):
+            if ctype == b"IEND":
+                break
+            continue
+        try:
+            key, _, rest = chunk.partition(b"\x00")
+            key = key.decode("latin-1")
+            if ctype == b"tEXt":
+                val = rest
+            elif ctype == b"zTXt":
+                val = zlib.decompress(rest[1:])
+            else:  # iTXt: compflag, compmethod, lang\0, translated\0, text
+                comp = rest[0:1] == b"\x01"
+                body = rest[2:]
+                _, _, body = body.partition(b"\x00")
+                _, _, body = body.partition(b"\x00")
+                val = zlib.decompress(body) if comp else body
+            val = val.decode("utf-8", errors="replace").strip()
+        except Exception:
+            continue
+        lk = key.lower()
+        if lk == "parameters":
+            findings.append("PNG 'parameters' chunk — Stable Diffusion WebUI "
+                            f"(declared AI): {val[:120]}")
+        elif lk in ("prompt", "workflow"):
+            findings.append(f"PNG '{key}' chunk — ComfyUI (declared AI): {val[:120]}")
+        elif lk in ("software", "comment", "description", "author", "source",
+                    "generator", "creation time"):
+            findings.append(f"PNG {key}: {val[:120]}")
+    return findings
+
+
+def _exif_findings(path):
+    findings = []
     # EXIF tags via Pillow — works for JPEG and TIFF alike (TIFF carries
-    # its tags natively, without the Exif marker searched for above)
+    # its tags natively rather than in an Exif marker segment)
     try:
         exif = Image.open(path).getexif()
         for tag, label in ((305, "software"), (271, "camera make"),
                            (272, "camera model"), (315, "artist"),
                            (306, "modified")):
             if tag in exif:
-                findings.append(f"{label}: {str(exif[tag]).strip()}")
+                findings.append(f"{label}: {str(exif[tag]).strip()[:120]}")
     except Exception:
         pass
-    for marker, label in [
-        (b"c2pa", "C2PA content credentials"),
-        (b"GContainer", "Google GContainer (Gemini/Pixel)"),
-        (b"trainedAlgorithmicMedia", "IPTC trainedAlgorithmicMedia (declared AI)"),
-        (b"Midjourney", "Midjourney"),
-        (b"DALL-E", "DALL-E"),
-    ]:
+    return findings
+
+
+AI_MARKERS = [
+    (b"trainedAlgorithmicMedia", "IPTC trainedAlgorithmicMedia (declared AI)"),
+    (b"Made with Google AI", "'Made with Google AI' credit (Gemini/Imagen)"),
+    (b"GContainer", "Google GContainer (Gemini/Pixel)"),
+    (b"SynthID", "SynthID mentioned in metadata"),
+    (b"Midjourney", "Midjourney"),
+    (b"DALL-E", "DALL-E"),
+    (b"Adobe Firefly", "Adobe Firefly"),
+    (b"Stable Diffusion", "Stable Diffusion"),
+    (b"ComfyUI", "ComfyUI"),
+    (b"NovelAI", "NovelAI"),
+]
+
+
+def check_metadata(path):
+    data = open(path, "rb").read()
+    findings = []
+    findings += _c2pa_findings(data)
+    findings += _xmp_findings(data)
+    findings += _png_findings(data)
+    findings += _exif_findings(path)
+    if data.find(b"Exif\x00\x00") != -1 and not any(
+            f.startswith(("software", "camera", "artist", "modified"))
+            for f in findings):
+        findings.append("EXIF block present")
+    for marker, label in AI_MARKERS:
         if data.find(marker) != -1:
             findings.append(label)
-    return findings
+    seen, out = set(), []
+    for f in findings:
+        if f not in seen:
+            seen.add(f)
+            out.append(f)
+    return out
 
 
 # ---------- Layer 2: visible watermark ----------

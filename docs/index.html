@@ -55,7 +55,7 @@
 
 <script>
 const PYCODE = String.raw`
-import base64, io, json
+import base64, io, json, re, zlib
 import numpy as np
 from PIL import Image, ImageFilter
 
@@ -75,27 +75,134 @@ def to_gray8(im):
         return Image.fromarray((a * 255).astype(np.uint8), "L")
     return im.convert("L")
 
+def _xmp_findings(data):
+    findings = []
+    packets = re.findall(rb"<x:xmpmeta[^>]*>.*?</x:xmpmeta>", data, re.S)
+    if not packets and data.find(b"http://ns.adobe.com/xap/1.0/") != -1:
+        return ["XMP block present (unparseable)"]
+    for pkt in packets:
+        text = pkt.decode("utf-8", errors="replace")
+        fields = [
+            (r'(?:xmp:)?CreatorTool\s*=\s*"([^"]+)"|<xmp:CreatorTool>([^<]+)<',
+             "XMP creator tool"),
+            (r'DigitalSourceType\s*=\s*"([^"]+)"|<Iptc4xmpExt:DigitalSourceType>([^<]+)<',
+             "XMP digital source type"),
+            (r'(?:photoshop|plus):Credit\s*=\s*"([^"]+)"|<(?:photoshop|plus):Credit>([^<]+)<',
+             "XMP credit"),
+            (r'dc:creator[^>]*>.*?<rdf:li[^>]*>([^<]+)<', "XMP creator"),
+        ]
+        got = False
+        for pattern, label in fields:
+            for m in re.finditer(pattern, text, re.S):
+                val = next((g for g in m.groups() if g), "").strip()
+                if val:
+                    findings.append(f"{label}: {val[:120]}")
+                    got = True
+        if not got:
+            findings.append("XMP packet present (no notable fields)")
+    return findings
+
+def _c2pa_findings(data):
+    findings = []
+    idx = data.find(b"c2pa.claim")
+    if idx == -1:
+        idx = data.find(b"c2pa")
+        if idx == -1 or data.find(b"jumb") == -1:
+            return findings
+    findings.append("C2PA content credentials manifest present")
+    region = data[max(0, idx - 4000):idx + 4000]
+    gi = region.find(b"claim_generator")
+    if gi != -1:
+        run = re.search(rb"[\x20-\x7e]{4,120}", region[gi + 15:gi + 300])
+        if run:
+            findings.append(
+                f"C2PA claim generator: {run.group().decode(errors='replace').strip()[:120]}")
+    for tool in (b"Adobe Firefly", b"Photoshop", b"DALL-E", b"OpenAI",
+                 b"Google", b"Gemini", b"Microsoft"):
+        if region.find(tool) != -1:
+            findings.append(f"C2PA mentions: {tool.decode()}")
+    return findings
+
+def _png_findings(data):
+    findings = []
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        return findings
+    pos = 8
+    while pos + 8 <= len(data):
+        length = int.from_bytes(data[pos:pos + 4], "big")
+        ctype = data[pos + 4:pos + 8]
+        chunk = data[pos + 8:pos + 8 + length]
+        pos += 12 + length
+        if ctype not in (b"tEXt", b"iTXt", b"zTXt"):
+            if ctype == b"IEND":
+                break
+            continue
+        try:
+            key, _, rest = chunk.partition(b"\x00")
+            key = key.decode("latin-1")
+            if ctype == b"tEXt":
+                val = rest
+            elif ctype == b"zTXt":
+                val = zlib.decompress(rest[1:])
+            else:
+                comp = rest[0:1] == b"\x01"
+                body = rest[2:]
+                _, _, body = body.partition(b"\x00")
+                _, _, body = body.partition(b"\x00")
+                val = zlib.decompress(body) if comp else body
+            val = val.decode("utf-8", errors="replace").strip()
+        except Exception:
+            continue
+        lk = key.lower()
+        if lk == "parameters":
+            findings.append("PNG 'parameters' chunk — Stable Diffusion WebUI "
+                            f"(declared AI): {val[:120]}")
+        elif lk in ("prompt", "workflow"):
+            findings.append(f"PNG '{key}' chunk — ComfyUI (declared AI): {val[:120]}")
+        elif lk in ("software", "comment", "description", "author", "source",
+                    "generator", "creation time"):
+            findings.append(f"PNG {key}: {val[:120]}")
+    return findings
+
+AI_MARKERS = [
+    (b"trainedAlgorithmicMedia", "IPTC trainedAlgorithmicMedia (declared AI)"),
+    (b"Made with Google AI", "'Made with Google AI' credit (Gemini/Imagen)"),
+    (b"GContainer", "Google GContainer (Gemini/Pixel)"),
+    (b"SynthID", "SynthID mentioned in metadata"),
+    (b"Midjourney", "Midjourney"),
+    (b"DALL-E", "DALL-E"),
+    (b"Adobe Firefly", "Adobe Firefly"),
+    (b"Stable Diffusion", "Stable Diffusion"),
+    (b"ComfyUI", "ComfyUI"),
+    (b"NovelAI", "NovelAI"),
+]
+
 def check_metadata(data):
     findings = []
-    if data.find(b"http://ns.adobe.com/xap/1.0/") != -1:
-        findings.append("XMP block present")
-    if data.find(b"Exif\x00\x00") != -1:
-        findings.append("EXIF block present")
-    for marker, label in [(b"c2pa", "C2PA content credentials"),
-                          (b"GContainer", "Google GContainer (Gemini/Pixel)"),
-                          (b"trainedAlgorithmicMedia", "IPTC trainedAlgorithmicMedia (declared AI)"),
-                          (b"Midjourney", "Midjourney"), (b"DALL-E", "DALL-E")]:
-        if data.find(marker) != -1:
-            findings.append(label)
+    findings += _c2pa_findings(data)
+    findings += _xmp_findings(data)
+    findings += _png_findings(data)
     try:
         exif = Image.open(io.BytesIO(data)).getexif()
         for tag, label in ((305, "software"), (271, "camera make"),
                            (272, "camera model"), (315, "artist"), (306, "modified")):
             if tag in exif:
-                findings.append(f"{label}: {str(exif[tag]).strip()}")
+                findings.append(f"{label}: {str(exif[tag]).strip()[:120]}")
     except Exception:
         pass
-    return findings
+    if data.find(b"Exif\x00\x00") != -1 and not any(
+            f.startswith(("software", "camera", "artist", "modified"))
+            for f in findings):
+        findings.append("EXIF block present")
+    for marker, label in AI_MARKERS:
+        if data.find(marker) != -1:
+            findings.append(label)
+    seen, out = set(), []
+    for f in findings:
+        if f not in seen:
+            seen.add(f)
+            out.append(f)
+    return out
 
 def make_star_template(size=32, p=0.5):
     n = size
@@ -410,9 +517,10 @@ async function run(file) {
     else if (likely.length) { v.className = 'verdict v-yellow'; v.textContent = `⚠️ ${likely.length} star-like shape(s) found — check the crops to judge whether they are watermarks or just artwork.`; }
     else { v.className = 'verdict v-green'; v.textContent = '✅ No star watermark found. Absence of evidence is not proof — watermarks can be cropped, and very faint marks can hide among the weak candidates.'; }
 
-    $('meta').innerHTML = res.meta.length
+    const synthidNote = '<p class="muted">ℹ️ SynthID (Google\'s invisible pixel watermark) cannot be checked locally — Google has not published a detector. To test, upload the image to Gemini and ask: “Does this image contain a SynthID watermark?”</p>';
+    $('meta').innerHTML = (res.meta.length
       ? '<ul>' + res.meta.map(m => `<li>${m.replace(/</g,'&lt;')}</li>`).join('') + '</ul>'
-      : '<p class="muted">None — EXIF/XMP/C2PA fully stripped. Proves nothing by itself, but the file\'s history can\'t be traced.</p>';
+      : '<p class="muted">None — C2PA/XMP/EXIF/PNG-chunks fully stripped. Proves nothing by itself, but the file\'s history can\'t be traced.</p>') + synthidNote;
 
     $('imgtitle').textContent = `Scanned image (${res.w}×${res.h})`;
     const an = $('annot');

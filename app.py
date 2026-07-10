@@ -82,9 +82,12 @@ PAGE = """<!doctype html>
   {% if result.meta %}
     <ul>{% for m in result.meta %}<li>{{ m }}</li>{% endfor %}</ul>
   {% else %}
-    <p class="muted">None — EXIF/XMP/C2PA fully stripped. This proves nothing by itself,
-    but means the file's history can't be traced.</p>
+    <p class="muted">None — C2PA/XMP/EXIF/PNG-chunks fully stripped. This proves nothing
+    by itself, but means the file's history can't be traced.</p>
   {% endif %}
+  <p class="muted">ℹ️ SynthID (Google's invisible pixel watermark) cannot be checked
+  locally — Google has not published a detector. To test, upload the image to Gemini
+  and ask: “Does this image contain a SynthID watermark?”</p>
 
   <h2>Scanned image ({{ result.w }}×{{ result.h }})</h2>
   <p class="muted">Red boxes = strong sparkle candidates, yellow = weak. Verify with the crops below.</p>
