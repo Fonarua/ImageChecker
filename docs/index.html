@@ -52,7 +52,7 @@
 <script src="https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js"></script>
 <script>
 const PYCODE = String.raw`
-import io, json
+import base64, io, json
 import numpy as np
 from PIL import Image, ImageFilter
 
@@ -204,10 +204,18 @@ def analyze(data, max_candidates=200):
              for s, n, x, y, z in scored]
     return json.dumps({"meta": meta, "w": im.size[0], "h": im.size[1],
                        "candidates": cands})
+
+def to_png_b64(data):
+    """PNG preview for formats the browser can't display (e.g. TIFF)."""
+    im = Image.open(io.BytesIO(bytes(data)))
+    im = (to_gray8(im) if im.mode in HIGH_DEPTH_MODES else im).convert("RGB")
+    buf = io.BytesIO()
+    im.save(buf, "PNG")
+    return base64.b64encode(buf.getvalue()).decode()
 `;
 
 const $ = id => document.getElementById(id);
-let pyodide = null, analyzeFn = null;
+let pyodide = null, analyzeFn = null, toPngFn = null;
 
 async function boot() {
   pyodide = await loadPyodide();
@@ -215,6 +223,7 @@ async function boot() {
   await pyodide.loadPackage(['numpy', 'pillow']);
   pyodide.runPython(PYCODE);
   analyzeFn = pyodide.globals.get('analyze');
+  toPngFn = pyodide.globals.get('to_png_b64');
   $('status').textContent = 'Ready — drop an image to check it.';
 }
 const bootPromise = boot().catch(e => { $('status').textContent = 'Failed to load Python runtime: ' + e; });
@@ -265,8 +274,9 @@ async function run(file) {
     const img = new Image();
     img.src = URL.createObjectURL(new Blob([buf]));
     try { await img.decode(); }
-    catch { // browser can't display TIFF: rebuild a PNG from pyodide? fall back to gray box
-      img.width = res.w; img.height = res.h;
+    catch { // browser can't display this format (e.g. TIFF): ask Python for a PNG
+      img.src = 'data:image/png;base64,' + toPngFn(pyodide.toPy(buf));
+      await img.decode();
     }
 
     const confirmed = res.candidates.filter(c => c.star >= CONFIRMED);
@@ -288,8 +298,7 @@ async function run(file) {
     const an = $('annot');
     an.width = res.w; an.height = res.h;
     const g = an.getContext('2d');
-    if (img.complete && img.naturalWidth) g.drawImage(img, 0, 0);
-    else { g.fillStyle = '#333'; g.fillRect(0, 0, res.w, res.h); }
+    g.drawImage(img, 0, 0);
     g.lineWidth = Math.max(2, res.w / 500);
     for (const [list, color] of [[confirmed, '#ff4455'], [likely, '#e6c34a']]) {
       g.strokeStyle = color;
